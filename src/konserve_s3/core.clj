@@ -1,4 +1,5 @@
 (ns konserve-s3.core
+  "DEPRECATED, not a good idea. See konserve-ddb+s3.core instead."
   (:require [clojure.core.async :as async]
             [clojure.edn :as edn]
             [clojure.spec.alpha :as s]
@@ -292,6 +293,18 @@
   [{:keys [bucket region]}]
   (async/go
     (let [client (aws-client/client {:api :s3 :region region})
+          delete-objects (loop [token nil]
+                           (let [objects (async/<! (aws/invoke client {:op :ListObjectsV2
+                                                                       :request {:Bucket bucket
+                                                                                 :ContinuationToken token}}))]
+                             (if (s/valid? ::anomalies/anomaly objects)
+                               objects
+                               (do
+                                 (loop [object-keys (map :Key (:Contents objects))]
+                                   (loop [version-marker nil]
+                                     (let [object-versions (async/<! ())])))
+                                 (when (:IsTruncated objects)
+                                   (recur (:NextContinuationToken objects)))))))
           result (async/<! (aws/invoke client
                                        {:op :DeleteBucket
                                         :request {:Bucket bucket}}))]

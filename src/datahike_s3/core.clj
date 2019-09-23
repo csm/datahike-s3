@@ -1,4 +1,5 @@
 (ns datahike-s3.core
+  "DEPRECATED, not a good idea. See datahike-ddb+s3.core instead."
   (:require [clojure.spec.alpha :as s]
             datahike.config
             [datahike.store :refer [empty-store delete-store connect-store release-store scheme->index]]

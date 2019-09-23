@@ -8,6 +8,7 @@
                  [com.cognitect.aws/api "0.8.352"]
                  [com.cognitect.aws/endpoints "1.1.11.632"]
                  [com.cognitect.aws/s3 "726.2.488.0"]
+                 [com.cognitect.aws/dynamodb "746.2.533.0"]
                  [com.cognitect/anomalies "0.1.12"]
                  [ch.qos.logback/logback-classic "1.1.8"]
                  [ch.qos.logback/logback-core "1.1.8"]]

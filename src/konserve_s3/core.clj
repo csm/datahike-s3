@@ -9,9 +9,8 @@
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
             [clojure.java.io :as io])
-  (:import [java.util Base64]
-           [clojure.lang ExceptionInfo IObj]
-           [java.io Closeable ByteArrayOutputStream PushbackReader]))
+  (:import [java.io Closeable ByteArrayOutputStream PushbackReader]
+           [java.util Base64]))
 
 (defn- encode-key
   [key]
@@ -24,6 +23,69 @@
        (io/reader)
        (PushbackReader.)
        (edn/read)))
+
+(defn- get-in*
+  [{:keys [client bucket serializer read-handlers write-handlers]} key-vec]
+  (async/go
+    (let [[object-key & ks] key-vec]
+      (if (empty? ks)
+        (let [prefix (str "edn/" (encode-key object-key) \/)]
+          (loop [result (volatile! (transient {}))
+                 token nil]
+            (let [response (async/<! (aws/invoke client {:op :ListObjectsV2
+                                                         :request {:Bucket bucket
+                                                                   :Prefix prefix
+                                                                   :ContinuationToken token}}))]
+              (if (s/valid? ::anomalies/anomaly response)
+                (ex-info "error making S3 request" {:error response})
+                (let [res (loop [object-keys (:Contents response)]
+                            (when-let [object-key (some-> object-keys first :Key)]
+                              (let [object-resp (async/<! (aws/invoke client {:op      :GetObject
+                                                                              :request {:Bucket bucket
+                                                                                        :Key    object-key}}))]
+                                (if (s/valid? ::anomalies/anomaly object-resp)
+                                  object-resp
+                                  (let [res (try
+                                              (let [k (->> (re-matches #"edn/([^/]+)/([^/]+)" object-key)
+                                                           (last)
+                                                           (decode-key))
+                                                    object (kp/-deserialize serializer read-handlers (:Body object-resp))]
+                                                (log/debug :key object-key :object object)
+                                                (vswap! result assoc! k object))
+                                              (catch Throwable t t))]
+                                    (if (instance? Throwable res)
+                                      res
+                                      (recur (rest object-keys))))))))]
+                  (cond
+                    (s/valid? ::anomalies/anomaly res)
+                    {:result (ex-info "error making S3 request" {:error res})}
+
+                    (instance? Throwable res)
+                    {:result res}
+
+                    (:IsTruncated response)
+                    (recur result (:NextContinuationToken response))
+
+                    :else {:result (not-empty (persistent! @result))}))))))
+        (let [[kk & ks] ks
+              response (async/<! (aws/invoke client {:op :GetObject
+                                                     :request {:Bucket  bucket
+                                                               :Key     (str "edn/" (encode-key object-key) \/ (encode-key kk))}}))]
+          (cond
+            (and (s/valid? ::anomalies/anomaly response)
+                 (= ::anomalies/not-found (::anomalies/category response)))
+            nil
+
+            (s/valid? ::anomalies/anomaly response)
+            (ex-info "failed to read object" {:error response :key-vec [object-key kk]})
+
+            :else
+            (try
+              (let [object (kp/-deserialize serializer write-handlers (:Body response))]
+                (if (not-empty ks)
+                  {:result (get-in object ks) ::version-id (:VersionId response)}
+                  {:result object ::version-id (:VersionId response)}))
+              (catch Exception x {:result x}))))))))
 
 (defrecord S3Store [client bucket read-handlers write-handlers serializer locks]
   Closeable
@@ -41,73 +103,8 @@
                                                              :Prefix (str "edn/" (encode-key key))}}))]
         (not (empty? (:Contents response))))))
 
-  (-get-in [_ key-vec]
-    (log/debug {:task ::kp/-get-in
-                :component ::S3Store
-                :key-vec key-vec})
-    (async/go
-      (let [[object-key & ks] key-vec]
-        (if (empty? ks)
-          (let [prefix (str "edn/" (encode-key object-key) \/)]
-            (loop [result (volatile! (transient {}))
-                   token nil]
-              (let [response (async/<! (aws/invoke client {:op :ListObjectsV2
-                                                           :request {:Bucket bucket
-                                                                     :Prefix prefix
-                                                                     :ContinuationToken token}}))]
-                (if (s/valid? ::anomalies/anomaly response)
-                  (ex-info "error making S3 request" {:error response})
-                  (let [res (loop [object-keys (:Contents response)]
-                              (when-let [object-key (some-> object-keys first :Key)]
-                                (let [object-resp (async/<! (aws/invoke client {:op      :GetObject
-                                                                                :request {:Bucket bucket
-                                                                                          :Key    object-key}}))]
-                                  (if (s/valid? ::anomalies/anomaly object-resp)
-                                    object-resp
-                                    (let [res (try
-                                                (let [k (->> (re-matches #"edn/([^/]+)/([^/]+)" object-key)
-                                                             (last)
-                                                             (decode-key))
-                                                      object (kp/-deserialize serializer read-handlers (:Body object-resp))]
-                                                  (log/debug :key object-key :object object)
-                                                  (vswap! result assoc! k
-                                                          (if (instance? IObj object)
-                                                            (with-meta object {::version (:VersionId object-resp)})
-                                                            object)))
-                                                (catch Throwable t t))]
-                                      (if (instance? Throwable res)
-                                        res
-                                        (recur (rest object-keys))))))))]
-                    (cond
-                      (s/valid? ::anomalies/anomaly res)
-                      (ex-info "error making S3 request" {:error res})
-
-                      (instance? Throwable res)
-                      res
-
-                      (:IsTruncated response)
-                      (recur result (:NextContinuationToken response))
-
-                      :else (not-empty (persistent! @result))))))))
-          (let [[kk & ks] ks
-                response (async/<! (aws/invoke client {:op :GetObject
-                                                       :request {:Bucket  bucket
-                                                                 :Key     (str "edn/" (encode-key object-key) \/ (encode-key kk))}}))]
-            (cond
-              (and (s/valid? ::anomalies/anomaly response)
-                   (= ::anomalies/not-found (::anomalies/category response)))
-              nil
-
-              (s/valid? ::anomalies/anomaly response)
-              (ex-info "failed to read object" {:error response :key-vec [object-key kk]})
-
-              :else
-              (try
-                (let [object (kp/-deserialize serializer write-handlers (:Body response))]
-                  (if (not-empty ks)
-                    (with-meta (get-in object ks) {::version-id (:VersionId response)})
-                    (with-meta object {::version-id (:VersionId response)})))
-                (catch Exception x x))))))))
+  (-get-in [this key-vec]
+    (async/go (:result (async/<! (get-in* this key-vec)))))
 
   (-update-in [this key-vec up-fn]
     (log/debug {:task ::kp/-update-in
@@ -118,11 +115,11 @@
       (let [[k1 k2 & ks] key-vec
             result (try
                      (let [object-key (str "edn/" (encode-key k1) \/ (encode-key k2))
-                           current-container (async/<! (kp/-get-in this [k1 k2]))
-                           _ (log/debug :current-container current-container)
-                           current-container (if (instance? Throwable current-container)
-                                               (throw current-container)
-                                               current-container)
+                           current (async/<! (get-in* this [k1 k2]))
+                           _ (log/debug :current current)
+                           current-container (if (instance? Throwable (:result current))
+                                               (throw (:result current))
+                                               current)
                            current-value (get-in current-container ks)
                            new-value (up-fn current-value)
                            new-container (if (empty? ks)
@@ -165,7 +162,7 @@
                        ; something with the current S3 API to make it atomic, possibly
                        ; with the help of another service that offers atomicity (such as
                        ; DynamoDB). But for now we're just winging it.
-                       (if (= (:VersionId current-metadata) (some-> current-container meta ::version-id))
+                       (if (= (:VersionId current-metadata) (::version-id current))
                          (let [commit (async/<! (aws/invoke client {:op :CompleteMultipartUpload
                                                                     :request {:Bucket          bucket
                                                                               :Key             object-key
@@ -220,11 +217,35 @@
                     (comment "handle response at all? Abort if we fail to delete? Throttle and retry if we exceed requests?"))
                   (recur (rest ks))))
               (when (:IsTruncated response)
-                (recur (:NextContinuationToken response))))))))))
+                (recur (:NextContinuationToken response)))))))))
 
-  ;kp/PBinaryAsyncKeyValueStore TODO
-  ;(-bget [_ key locked-cb])
-  ;(-bassoc [_ key val]))
+  ; hmm, not needed for datahike?
+  kp/PBinaryAsyncKeyValueStore
+  (-bget [_ key locked-cb]
+    (log/debug :task ::kp/-bget
+               :component ::S3Store
+               :key key)
+    (async/go
+      (let [result (async/<! (aws/invoke client {:op :GetObject
+                                                 :request {:Bucket bucket
+                                                           :Key (str "bin/" (encode-key key))}}))]
+        (if (s/valid? ::anomalies/anomaly result)
+          (ex-info "failed to read binary" {:error result})
+          (locked-cb {:input-stream (:Body result)
+                      :size (:ContentLength result)})))))
+
+  (-bassoc [_ key val]
+    (log/debug :task ::kp/-bassoc
+               :component ::S3Store
+               :key key
+               :val val)
+    (async/go
+      (let [result (async/<! (aws/invoke client {:op :PutObject
+                                                 :request {:Bucket bucket
+                                                           :Key (str "bin/" (encode-key key))
+                                                           :Body val}}))]
+        (when (s/valid? ::anomalies/anomaly result)
+          (ex-info "failed to write binary" {:error result}))))))
 
 (defn new-s3-store
   [{:keys [bucket region read-handlers write-handlers serializer]

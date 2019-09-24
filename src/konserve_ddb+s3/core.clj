@@ -1,14 +1,15 @@
 (ns konserve-ddb+s3.core
   "Konserve store implementation using DynamoDB and S3.
 
-  This assumes usage by datahike, it's not intended to be a
-  generic Konserve store.
+  DynamoDB is used to just hold addresses into S3, so
+  when you assoc/update a key :foo that adds a key :foo
+  (mangled with the database name) to dynamodb with
+  value {:address S3_ADDR}; the data itself is stored
+  in s3 with (mangled) key S3_ADDR, which is just a UUID.
 
-  By default, the :db toplevel key is always stored in DynamoDB,
-  and is subject to atomicity guarantees; all other keys are stored
-  in S3, and do *not* provide atomicity guarantees. The set of toplevel
-  keys that are stored in DynamoDB is configurable, if you want to try
-  something different."
+  DynamoDB is always updated using a integer rev field
+  that increments on each change; concurrent changes are
+  retried, if they don't match the current rev value."
   (:require [clojure.core.async :as async]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -27,15 +28,6 @@
   "Encodes a key to URL-safe Base64."
   [prefix key]
   (.encodeToString (Base64/getUrlEncoder) (.getBytes (pr-str [prefix key]) "UTF-8")))
-
-(defn- decode-key
-  "Decodes a URL-safe Base64 key string to its components, [prefix key]."
-  [key]
-  (->> (.getBytes key "UTF-8")
-       (.decode (Base64/getUrlDecoder))
-       (io/reader)
-       (PushbackReader.)
-       (edn/read)))
 
 (defn- nano-clock
   ([] (nano-clock (Clock/systemUTC)))
@@ -133,15 +125,11 @@
                                (if (s/valid? ::anomalies/anomaly s3-response)
                                  s3-response
                                  (let [current-value (some->> s3-response :Body (kp/-deserialize serializer read-handlers))
-                                       _ (log/debug "current value" current-value)
                                        current-rev (some-> response :Item :rev :N (Long/parseLong))
-                                       _ (log/debug "current rev" current-rev)
                                        new-value (if (empty? ks)
                                                    (up-fn current-value)
                                                    (update-in current-value ks up-fn))
-                                       _ (log/debug "new-value" new-value)
                                        new-rev (some-> current-rev inc)
-                                       _ (log/debug "new-rev" new-rev)
                                        encoded (let [out (ByteArrayOutputStream.)]
                                                  (kp/-serialize serializer out write-handlers new-value)
                                                  (.toByteArray out))
@@ -175,7 +163,6 @@
                                                                                                                         "val" {:B info-encoded}}
                                                                                                   :ConditionExpression "attribute_not_exists(id)"}})))]
                                        (log/debug {:task :ddb-put-item :phase :end :key ek :ms (ms clock begin)})
-                                       (log/debug :response response)
                                        ; return values for conditional operation failures don't seem that "strongly typed"...
                                        ; I'm not sure what to rely on: category? message? __type?
                                        (cond (and (s/valid? ::anomalies/anomaly response)

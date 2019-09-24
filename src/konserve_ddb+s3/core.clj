@@ -20,7 +20,7 @@
             [cognitect.aws.client.api :as aws-client]
             [clojure.tools.logging :as log])
   (:import [java.io PushbackReader ByteArrayOutputStream ByteArrayInputStream Closeable]
-           [java.util Base64]
+           [java.util Base64 UUID]
            [java.time Clock Duration]))
 
 (defn- encode-key
@@ -59,193 +59,181 @@
   (-exists? [_ key]
     (let [begin (.instant clock)]
       (async/go
-        (if (ddb-keys key)
-          (let [ek (encode-key dynamo-prefix key)
-                response (async/<! (aws/invoke ddb-client {:op      :GetItem
-                                                           :request {:TableName       table-name
-                                                                     :Key             {"id" {:S ek}}
-                                                                     :AttributesToGet ["id"]
-                                                                     :ConsistentRead  true}}))]
-            (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
-            (if (s/valid? ::anomalies/anomaly response)
-              (ex-info "failed to read dynamodb" {:error response})
-              (not (empty? response))))
-          (let [ek (encode-key s3-prefix key)
-                response (async/<! (aws/invoke s3-client {:op      :HeadObject
-                                                          :request {:Bucket bucket-name
-                                                                    :Key    ek}}))]
-            (log/debug {:task :s3-head-object :phase :end :key ek :ms (ms clock begin)})
-            (cond (and (s/valid? ::anomalies/anomaly response)
-                       (= ::anomalies/not-found (::anomalies/category response)))
-                  false
-
-                  (s/valid? ::anomalies/anomaly response)
-                  (ex-info "failed to read S3" {:error response})
-
-                  :else
-                  true))))))
+        (let [ek (encode-key dynamo-prefix key)
+              response (async/<! (aws/invoke ddb-client {:op      :GetItem
+                                                         :request {:TableName       table-name
+                                                                   :Key             {"id" {:S ek}}
+                                                                   :AttributesToGet ["val"]
+                                                                   :ConsistentRead  true}}))]
+          (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+          (if (s/valid? ::anomalies/anomaly response)
+            (ex-info "failed to read dynamodb" {:error response})
+            (not (empty? response)))))))
 
   (-get-in [_ key-vec]
     (let [begin (.instant clock)]
       (async/go
         (let [[k & ks] key-vec
-              value (if (ddb-keys k)
-                      (let [ek (encode-key dynamo-prefix k)
-                            response (async/<! (aws/invoke ddb-client {:op      :GetItem
-                                                                       :request {:TableName       table-name
-                                                                                 :Key             {"id" {:S ek}}
-                                                                                 :AttributesToGet ["val"]
-                                                                                 :ConsistentRead  true}}))]
-                        (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
-                        (cond (empty? response) nil
+              value (let [ek (encode-key dynamo-prefix k)
+                          response (async/<! (aws/invoke ddb-client {:op      :GetItem
+                                                                     :request {:TableName       table-name
+                                                                               :Key             {"id" {:S ek}}
+                                                                               :AttributesToGet ["val"]
+                                                                               :ConsistentRead  true}}))]
+                      (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+                      (cond (empty? response) nil
 
-                              (s/valid? ::anomalies/anomaly response)
-                              (ex-info "failed to read dynamodb" {:error response})
+                            (s/valid? ::anomalies/anomaly response)
+                            (ex-info "failed to read dynamodb" {:error response})
 
-                              :else
-                              (kp/-deserialize serializer read-handlers (-> response :Item :val :B))))
-                      (let [ek (encode-key s3-prefix k)
-                            response (async/<! (aws/invoke s3-client {:op      :GetObject
-                                                                      :request {:Bucket bucket-name
-                                                                                :Key    ek}}))]
-                        (log/debug {:task :s3-get-object :phase :end :key ek :ms (ms clock begin)})
-                        (cond (and (s/valid? ::anomalies/anomaly response)
-                                   (= ::anomalies/not-found (::anomalies/category response)))
-                              nil
+                            :else
+                            (let [info (kp/-deserialize serializer read-handlers (-> response :Item :val :B))]
+                              (when-let [value-addr (get info :address)]
+                                (let [begin (.instant clock)
+                                      s3k (encode-key s3-prefix value-addr)
+                                      response (async/<! (aws/invoke s3-client {:op :GetObject
+                                                                                :request {:Bucket bucket-name
+                                                                                          :Key    s3k}}))]
+                                  (log/debug {:task :s3-get-object :phase :end :key s3k :ms (ms clock begin)})
+                                  (cond (s/valid? ::anomalies/anomaly response)
+                                        (ex-info "failed to read S3" {:error response})
 
-                              (s/valid? ::anomalies/anomaly response)
-                              (ex-info "failed to read S3" {:error response})
-
-                              :else
-                              (kp/-deserialize serializer read-handlers (:Body response)))))]
+                                        :else
+                                        (kp/-deserialize serializer read-handlers (:Body response))))))))]
           (if (instance? Throwable value)
             value
             (get-in value ks))))))
 
   (-update-in [_ key-vec up-fn]
-    (let [begin (.instant clock)]
-      (async/go
-        (try
-          (let [[k & ks] key-vec
-                result (if (ddb-keys k)
-                         (loop []
-                           (let [ek (encode-key dynamo-prefix k)
-                                 response (async/<! (aws/invoke ddb-client {:op      :GetItem
-                                                                            :request {:TableName       table-name
-                                                                                      :Key             {"id" {:S ek}}
-                                                                                      :AttributesToGet ["val" "rev"]
-                                                                                      :ConsistentRead  true}}))]
-                             (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
-                             (log/debug :response response)
-                             (if (s/valid? ::anomalies/anomaly response)
-                               (ex-info "failed to read dynamodb" {:error response})
-                               (let [current-value (some->> response :Item :val :B (kp/-deserialize serializer read-handlers))
-                                     _ (log/debug "current value" current-value)
-                                     current-rev (some-> response :Item :rev :N (Long/parseLong))
-                                     _ (log/debug "current rev" current-rev)
-                                     new-value (if (empty? ks)
-                                                 (up-fn current-value)
-                                                 (update-in current-value ks up-fn))
-                                     _ (log/debug "new-value" new-value)
-                                     new-rev (some-> current-rev inc)
-                                     _ (log/debug "new-rev" new-rev)
-                                     encoded (let [out (ByteArrayOutputStream.)]
-                                               (kp/-serialize serializer out write-handlers new-value)
-                                               (.toByteArray out))
-                                     response (async/<! (aws/invoke ddb-client (if (some? current-value)
-                                                                                 {:op      :UpdateItem
-                                                                                  :request {:TableName                 table-name
-                                                                                            :Key                       {"id" {:S ek}}
-                                                                                            :UpdateExpression          "SET rev = :newrev, val = :newval"
-                                                                                            :ConditionExpression       "attribute_exists(id) AND rev = :oldrev"
-                                                                                            :ExpressionAttributeValues {":oldrev" {:N (str current-rev)}
-                                                                                                                        ":newrev" {:N (str new-rev)}
-                                                                                                                        ":newval" {:B encoded}}}}
-                                                                                 {:op      :PutItem
-                                                                                  :request {:TableName table-name
-                                                                                            :Item {"id" {:S (encode-key dynamo-prefix k)}
-                                                                                                   "rev" {:N "0"}
-                                                                                                   "val" {:B encoded}}
-                                                                                            :ConditionExpression "attribute_not_exists(id)"}})))]
-                                 (log/debug {:task :ddb-put-item :phase :end :key ek :ms (ms clock begin)})
-                                 (log/debug :response response)
-                                 ; return values for conditional operation failures don't seem that "strongly typed"...
-                                 ; I'm not sure what to rely on: category? message? __type?
-                                 (cond (and (s/valid? ::anomalies/anomaly response)
-                                            (= ::anomalies/incorrect (::anomalies/category response))
-                                            (or (= "The conditional request failed" (:message response))
-                                                (.contains (:__type response "") "ConditionalCheckFailedException")))
-                                       (recur)
+    (async/go
+      (try
+        (let [[k & ks] key-vec
+              result (let [value-id (UUID/randomUUID)]
+                       (loop []
+                         (let [begin (.instant clock)
+                               ek (encode-key dynamo-prefix k)
+                               response (async/<! (aws/invoke ddb-client {:op      :GetItem
+                                                                          :request {:TableName       table-name
+                                                                                    :Key             {"id" {:S ek}}
+                                                                                    :AttributesToGet ["val" "rev"]
+                                                                                    :ConsistentRead  true}}))]
+                           (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+                           (log/debug :response response)
+                           (if (s/valid? ::anomalies/anomaly response)
+                             (ex-info "failed to read dynamodb" {:error response})
+                             (let [current-info (some->> response :Item :val :B (kp/-deserialize serializer read-handlers))
+                                   current-value-id (get current-info :address)
+                                   begin (.instant clock)
+                                   s3k (encode-key s3-prefix current-value-id)
+                                   s3-response (when current-value-id
+                                                 (async/<! (aws/invoke s3-client {:op :GetObject
+                                                                                  :request {:Bucket bucket-name
+                                                                                            :Key    s3k}})))]
+                               (log/debug {:task :s3-get-object :phase :end :key s3k :ms (ms clock begin)})
+                               (if (s/valid? ::anomalies/anomaly s3-response)
+                                 s3-response
+                                 (let [current-value (some->> s3-response :Body (kp/-deserialize serializer read-handlers))
+                                       _ (log/debug "current value" current-value)
+                                       current-rev (some-> response :Item :rev :N (Long/parseLong))
+                                       _ (log/debug "current rev" current-rev)
+                                       new-value (if (empty? ks)
+                                                   (up-fn current-value)
+                                                   (update-in current-value ks up-fn))
+                                       _ (log/debug "new-value" new-value)
+                                       new-rev (some-> current-rev inc)
+                                       _ (log/debug "new-rev" new-rev)
+                                       encoded (let [out (ByteArrayOutputStream.)]
+                                                 (kp/-serialize serializer out write-handlers new-value)
+                                                 (.toByteArray out))
+                                       begin (.instant clock)
+                                       new-key (encode-key s3-prefix value-id)
+                                       s3-upload (async/<! (aws/invoke s3-client {:op :PutObject
+                                                                                  :request {:Bucket bucket-name
+                                                                                            :Key    new-key
+                                                                                            :Body   encoded}}))]
+                                   (log/debug {:task :s3-put-object :phase :end :key new-key :ms (ms clock begin)})
+                                   (if (s/valid? ::anomalies/anomaly s3-upload)
+                                     s3-upload
+                                     (let [new-info (assoc current-info :address value-id)
+                                           info-encoded (let [out (ByteArrayOutputStream.)]
+                                                          (kp/-serialize serializer out write-handlers new-info)
+                                                          (.toByteArray out))
+                                           begin (.instant clock)
+                                           response (async/<! (aws/invoke ddb-client (if (some? current-info)
+                                                                                       {:op      :UpdateItem
+                                                                                        :request {:TableName                 table-name
+                                                                                                  :Key                       {"id" {:S ek}}
+                                                                                                  :UpdateExpression          "SET rev = :newrev, val = :newval"
+                                                                                                  :ConditionExpression       "attribute_exists(id) AND rev = :oldrev"
+                                                                                                  :ExpressionAttributeValues {":oldrev" {:N (str current-rev)}
+                                                                                                                              ":newrev" {:N (str new-rev)}
+                                                                                                                              ":newval" {:B info-encoded}}}}
+                                                                                       {:op      :PutItem
+                                                                                        :request {:TableName           table-name
+                                                                                                  :Item                {"id"  {:S (encode-key dynamo-prefix k)}
+                                                                                                                        "rev" {:N "0"}
+                                                                                                                        "val" {:B info-encoded}}
+                                                                                                  :ConditionExpression "attribute_not_exists(id)"}})))]
+                                       (log/debug {:task :ddb-put-item :phase :end :key ek :ms (ms clock begin)})
+                                       (log/debug :response response)
+                                       ; return values for conditional operation failures don't seem that "strongly typed"...
+                                       ; I'm not sure what to rely on: category? message? __type?
+                                       (cond (and (s/valid? ::anomalies/anomaly response)
+                                                  (= ::anomalies/incorrect (::anomalies/category response))
+                                                  (or (= "The conditional request failed" (:message response))
+                                                      (.contains (:__type response "") "ConditionalCheckFailedException")))
+                                             (do
+                                               (log/debug {:task :retry-update-in})
+                                               (recur))
 
-                                       (s/valid? ::anomalies/anomaly response)
-                                       (ex-info "failed to update item" {:error response})
+                                             (s/valid? ::anomalies/anomaly response)
+                                             (ex-info "failed to update item" {:error response})
 
-                                       :else
-                                       [(get-in current-value ks) (get-in new-value ks)])))))
-                         (let [ek (encode-key s3-prefix k)
-                               response (async/<! (aws/invoke s3-client {:op      :GetObject
-                                                                         :request {:Bucket bucket-name
-                                                                                   :Key    ek}}))
-                               current-value (do
-                                               (log/debug {:task :s3-get-object :phase :end :key ek :ms (ms clock begin)})
-                                               (cond (and (s/valid? ::anomalies/anomaly response)
-                                                          (= ::anomalies/not-found (::anomalies/category response)))
-                                                     nil
-
-                                                     (s/valid? ::anomalies/anomaly response)
-                                                     (ex-info "failed to read S3 object" {:error response})
-
-                                                     :else
-                                                     (kp/-deserialize serializer read-handlers (:Body response))))
-                               error? (instance? Throwable current-value)
-                               new-value (when-not error?
-                                           (if (empty? ks)
-                                             (up-fn current-value)
-                                             (update-in current-value ks up-fn)))
-                               encoded (when-let [out (when-not error?
-                                                        (ByteArrayOutputStream.))]
-                                         (kp/-serialize serializer out write-handlers new-value)
-                                         (.toByteArray out))
-                               response (when-not error?
-                                          (async/<! (aws/invoke s3-client {:op :PutObject
-                                                                           :request {:Bucket bucket-name
-                                                                                     :Key    ek
-                                                                                     :Body   encoded}})))]
-                           (when (some? response)
-                             (log/debug {:task :s3-put-object :phase :end :key ek :ms (ms clock begin)}))
-                           (cond error?
-                                 current-value
-
-                                 (s/valid? ::anomalies/anomaly response)
-                                 (ex-info "failed to put S3 object" {:error response})
-
-                                 :else
-                                 [(get-in current-value ks) (get-in new-value ks)])))]
-            result)
-          (catch Throwable t t)))))
+                                             :else
+                                             (do
+                                               (let [begin (.instant clock)
+                                                     s3-delete (async/<! (aws/invoke s3-client {:op :DeleteObject
+                                                                                                :request {:Bucket bucket-name
+                                                                                                          :Key s3k}}))]
+                                                 (log/debug {:task :s3-delete-object :phase :end :key s3k :ms (ms clock begin) :success? (not (s/valid? ::anomalies/anomaly s3-delete))})
+                                                 [(get-in current-value ks) (get-in new-value ks)]))))))))))))]
+          result)
+        (catch Throwable t t))))
 
   (-assoc-in [this key-vec val]
     (kp/-update-in this key-vec (constantly val)))
 
   (-dissoc [_ key]
-    (let [begin (.instant clock)]
-      (async/go
-        (if (ddb-keys key)
-          (let [ek (encode-key dynamo-prefix key)
-                response (async/<! (aws/invoke ddb-client {:op :DeleteItem
-                                                           :request {:TableName table-name
-                                                                     :Key {"id" {:S ek}}}}))]
-            (log/debug {:task :ddb-delete-item :phase :end :key ek :ms (ms clock begin)})
-            (when (s/valid? ::anomalies/anomaly response)
-              (ex-info "failed to delete dynamodb item" {:error response})))
-          (let [ek (encode-key s3-prefix key)
-                response (async/<! (aws/invoke s3-client {:op :DeleteObject
-                                                          :request {:Bucket bucket-name
-                                                                    :Key    ek}}))]
-            (log/debug {:task :s3-delete-object :phase :end :key ek :ms (ms clock begin)})
-            (when (and (s/valid? ::anomalies/anomaly response)
-                       (not= ::anomalies/not-found (::anomalies/category response)))
-              (ex-info "failed to delete S3 item" {:error response})))))))
+    (async/go
+      (let [begin (.instant clock)
+            ek (encode-key dynamo-prefix key)
+            response (async/<! (aws/invoke ddb-client {:op :GetItem
+                                                       :request {:TableName       table-name
+                                                                 :Key             {"id" {:S ek}}
+                                                                 :AttributesToGet ["val"]}}))]
+        (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+        (if (s/valid? ::anomalies/anomaly response)
+          (ex-info "failed to delete dynamodb item" {:error response})
+          (let [info (->> response :Item :val :B (kp/-deserialize serializer read-handlers))
+                address (get info :address)
+                begin (.instant clock)
+                s3-key (encode-key s3-prefix address)
+                s3-delete (async/<! (aws/invoke s3-client {:op :DeleteObject
+                                                           :request {:Bucket bucket-name
+                                                                     :Key    s3-key}}))]
+            (log/debug {:task :s3-delete-object :phase :end :key s3-key :ms (ms clock begin)})
+            (let [begin (.instant clock)
+                  ddb-delete (async/<! (aws/invoke ddb-client {:op :DeleteItem
+                                                               :request {:TableName table-name
+                                                                         :Key       {"id" {:S ek}}}}))]
+              (log/debug {:task :ddb-delete-item :phase :end :key ek :ms (ms clock begin)})
+              (cond (s/valid? ::anomalies/anomaly ddb-delete)
+                    (ex-info "failed to delete dynamodb value" {:error ddb-delete})
+
+                    (s/valid? ::anomalies/anomaly s3-delete)
+                    (ex-info "failed to delete S3 value" {:error s3-delete})
+
+                    :else nil)))))))
 
   Closeable
   (close [_]

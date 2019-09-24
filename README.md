@@ -22,8 +22,3 @@ To try things out:
 
 (def conn (d/connect "datahike:ddb+s3://us-west-2/my-ddb-table/my-s3-bucket"))
 ```
-
-## *TODO*
-
-* Does datahike exceed 400KB in the `:db` value? If so, might have to split up the
-  value.

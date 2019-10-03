@@ -5,6 +5,7 @@
             :url "https://www.eclipse.org/legal/epl-2.0/"}
   :dependencies [[org.clojure/clojure "1.10.1"]
                  [io.replikativ/datahike "0.2.0"]
+                 [com.github.csm/konserve-ddb-s3 "0.1.0-alpha1"]
                  [com.cognitect.aws/api "0.8.352"]
                  [com.cognitect.aws/endpoints "1.1.11.632"]
                  [com.cognitect.aws/s3 "726.2.488.0"]

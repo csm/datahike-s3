@@ -1,12 +1,16 @@
 (ns datahike-ddb+s3.core
   (:require [clojure.spec.alpha :as s]
             [datahike.store :refer [empty-store delete-store connect-store release-store scheme->index]]
-            [konserve-ddb+s3.core :as kc-ddb+s3]
+            [konserve-ddb-s3.core :as kc-ddb-s3]
             [superv.async :refer [<?? S]]
             [hitchhiker.konserve :as kons]))
 
-; add ddb+s3 backend
+; add ddb+s3 backend. Is there a better way to add values to a set spec?
 (s/def :datahike.config/backend #{:mem :file :pg :level :ddb+s3})
+
+; bind these to custom clients if you want, e.g. to connect to local instances instead.
+(def ^:dynamic *ddb-client* nil)
+(def ^:dynamic *s3-client* nil)
 
 (defn- ->config
   [{:keys [host path]}]
@@ -16,20 +20,23 @@
     {:region host
      :table table
      :bucket bucket
-     :database (or database :datahike)}))
+     :database (or database :datahike)
+     :consistent-key #{:db}
+     :ddb-client *ddb-client*
+     :s3-client *s3-client*}))
 
 (defmethod empty-store :ddb+s3
   [config]
   (kons/add-hitchhiker-tree-handlers
-    (<?? S (kc-ddb+s3/empty-store (->config config)))))
+    (<?? S (kc-ddb-s3/empty-store (->config config)))))
 
 (defmethod delete-store :ddb+s3
   [config]
-  (<?? S (kc-ddb+s3/delete-store (->config config))))
+  (<?? S (kc-ddb-s3/delete-store (->config config))))
 
 (defmethod connect-store :ddb+s3
   [config]
-  (<?? S (kc-ddb+s3/connect-store (->config config))))
+  (<?? S (kc-ddb-s3/connect-store (->config config))))
 
 (defmethod release-store :ddb+s3
   [_ store]

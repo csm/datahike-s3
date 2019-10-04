@@ -444,6 +444,13 @@
 (transact* (get mbrainz-txns (nth txns 3)))
 
 (def len (count txns))
-(doseq [[i t] (drop 4 (map-indexed vector txns))]
-  (println "transact" i "of" len)
-  (transact* (get mbrainz-txns t)))
+(def current (atom 0))
+(def running (atom true))
+
+(async/thread
+  (loop [items (drop 4 (map-indexed vector txns))]
+    (when @running
+      (when-let [[i t] (first items)]
+        (reset! current i)
+        (transact* (get mbrainz-txns t))
+        (recur (rest items))))))

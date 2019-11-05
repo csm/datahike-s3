@@ -1,7 +1,7 @@
 (in-ns 'datahike-s3.repl)
 
 ; to run this, add profiles.clj with:
-; {:repl {:dependencies [s4 "0.1.4"]
+; {:repl {:dependencies [s4 "0.1.9"]
 ;                       [com.amazonaws/DynamoDBLocal "1.11.477"
 ;                        :exclusions [com.fasterxml.jackson.core/jackson-core
 ;                                     org.eclipse.jetty/jetty-client
@@ -454,3 +454,25 @@
         (reset! current i)
         (transact* (get mbrainz-txns t))
         (recur (rest items))))))
+
+(require '[s4.$$$$ :as $])
+($/get-cost-estimate (-> @s4 :cost-tracker) (java.util.Date.))
+
+(require '[konserve.protocols :as kp])
+(def total (->> (async/<!! (kp/-get-in konserve [:version-meta "mbrainz"]))
+                (vals)
+                (map first)
+                (map :content-length)
+                (remove nil?)
+                (reduce + 0)))
+
+; estimate how long between two transactions with this
+(let [init @current]
+  (while (= init @current)
+    (Thread/sleep 100))
+  (let [begin (System/currentTimeMillis)
+        first @current]
+    (while (= first @current)
+      (Thread/sleep 100))
+    (let [elapsed (- (System/currentTimeMillis) begin)]
+      (println init first @current (double (/ elapsed 1000))))))

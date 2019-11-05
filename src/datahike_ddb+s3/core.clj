@@ -3,7 +3,8 @@
             [datahike.store :refer [empty-store delete-store connect-store release-store scheme->index]]
             [konserve-ddb-s3.core :as kc-ddb-s3]
             [superv.async :refer [<?? S]]
-            [hitchhiker.konserve :as kons]))
+            [hitchhiker.konserve :as kons]
+            [clojure.tools.logging :as log]))
 
 ; add ddb+s3 backend. Is there a better way to add values to a set spec?
 (s/def :datahike.config/backend #{:mem :file :pg :level :ddb+s3})
@@ -36,7 +37,9 @@
 
 (defmethod connect-store :ddb+s3
   [config]
-  (<?? S (kc-ddb-s3/connect-store (->config config))))
+  (let [config (->config config)]
+    (log/debug "ddb+s3 connect-store config:" (pr-str config))
+    (<?? S (kc-ddb-s3/connect-store config))))
 
 (defmethod release-store :ddb+s3
   [_ store]

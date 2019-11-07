@@ -1,5 +1,9 @@
 # datahike-s3
 
+**Not doing much in this repo anymore;** see [this fork of datahike](https://github.com/csm/datahike/tree/aws), which
+requires [this fork of hitchhiker-tree](https://github.com/csm/hitchhiker-tree/tree/separate-ops-buffer) and [this
+konserve implementation](https://github.com/csm/konserve-ddb-s3).
+
 Experimental.
 
 Playing around with [datahike](https://github.com/replikativ/datahike)
